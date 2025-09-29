@@ -63,83 +63,96 @@
         var scene = null;
         var sceneToRender = null;
         var createDefaultEngine = function() { return new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true,  disableWebGL2Support: false}); };
-        // Full drop-in code for Babylon.js:
-// - AR mode: WebXR + Hit Test + right trigger to place MANY models
-// - AR mode: Right thumbstick moves the currently selected model on the horizontal plane
-// - Reticle: clearly visible (green, lighting-independent), and not pickable
-// NOTE: Desktop fallback has been REMOVED per request.
-// NOTE: XR controller thumbstick is dedicated to MOVING the selected model;
-//       camera movement/teleportation features are disabled.
+        // AR-only version
+// - Right trigger: place MANY Pikachus (each becomes selected)
+// - Right thumbstick: move the SELECTED Pikachu on XZ plane
+// - No desktop fallback
+// - Reticle: green & unpickable
+// - Robust instancing: clone child meshes to avoid empty clones
 
-var placedList = [];                 // store all placed instances
-var selectedInst = null;             // the instance to move
-var FACE_YAW = Math.PI;              // rotate 180° so the model faces you (tweak if needed)
-var MOVE_SPEED = 0.6;                // m/s for AR thumbstick
+var placedList = [];        // all placed instances' roots (TransformNode)
+var selectedInst = null;    // current selected root
+var FACE_YAW = Math.PI;     // face user
+var MOVE_SPEED = 0.6;       // m/s
 
-// helper: (kept for consistency; harmless in XR) tag the instance as "placed"
-function attachHorizontalDrag(inst, scene) {
-    // Keep only the metadata tag; remove desktop drag behavior entirely
-    if (!inst.metadata) inst.metadata = {};
-    inst.metadata.placed = true;
+// Robust "prototype" -> "new instance" creator
+function createInstanceFromPrototype(proto, name, scene) {
+    var root = new BABYLON.TransformNode(name, scene);
+    // 逐个克隆子网格并挂到新 root 下
+    proto.getChildMeshes().forEach(function (m, i) {
+        var c = m.clone(name + "_m" + i, root);
+        c.isVisible = true;
+        c.setEnabled(true);
+    });
+    // 复制缩放/旋转(避免每次再设)
+    root.scaling.copyFrom(proto.scaling);
+    if (proto.rotationQuaternion) {
+        root.rotationQuaternion = proto.rotationQuaternion.clone();
+    } else {
+        root.rotation.copyFrom(proto.rotation);
+    }
+    return root;
 }
 
 var createScene = function () {
-    // ---------- Your original setup ----------
     var scene = new BABYLON.Scene(engine);
 
+    // ----- camera & light
     var camera = new BABYLON.FreeCamera("camera1", new BABYLON.Vector3(0, 5, -10), scene);
     camera.setTarget(BABYLON.Vector3.Zero());
-    camera.attachControl(canvas, true); // harmless in XR; needed if你在PC上看看画面
+    camera.attachControl(canvas, true); // harmless in XR
 
     var light = new BABYLON.HemisphericLight("light", new BABYLON.Vector3(0, 1, 0), scene);
     light.intensity = 0.7;
 
+    // ----- ground 先创建(方便你在非XR环境里也能看到舞台)
+    var ground = BABYLON.MeshBuilder.CreateGround("ground", { width: 6, height: 6 }, scene);
+
+    // ----- load GLB into a HIDDEN prototype hierarchy
     var GLB_URL = "./pikachu.glb";
-    var modelProto = null; // prototype holder to clone for placement
+    var modelProto = null;
 
     BABYLON.SceneLoader.Append("", GLB_URL, scene, function () {
-        // Group everything (except ground) under a hidden root as prototype
-        var all = scene.meshes.filter(function (m) { return m.name !== "ground"; });
-        var root = new BABYLON.TransformNode("root", scene);
-        all.forEach(function (m) { m.setParent(root); });
+        // 把场景中除了 ground 的网格都收拢到一个隐藏 root 作为“原型”
+        var meshes = scene.meshes.filter(function (m) { return m && m.name !== "ground"; });
+        var root = new BABYLON.TransformNode("protoRoot", scene);
+        meshes.forEach(function (m) { m.setParent(root); });
 
         root.scaling.setAll(0.05);
         root.rotation = new BABYLON.Vector3(0, Math.PI, 0);
-        root.setEnabled(false);        // keep as prototype (hidden)
+
+        // 隐藏:逐个禁用子网格,避免原型本体出现在场景中
+        root.getChildMeshes().forEach(function (m) { m.setEnabled(false); m.isVisible = false; });
+
         modelProto = root;
+        // console.log("Prototype ready with", root.getChildMeshes().length, "meshes");
     });
 
-    var ground = BABYLON.MeshBuilder.CreateGround("ground", { width: 6, height: 6 }, scene);
-
-    // ---------- WebXR AR + Hit Test + right trigger to place ----------
+    // ----- WebXR (AR) + Hit Test
     scene.createDefaultXRExperienceAsync({
         uiOptions: { sessionMode: "immersive-ar", referenceSpaceType: "local-floor" },
         optionalFeatures: true
     }).then(function (xr) {
 
-        // ✅ 关闭可能占用摇杆的 XR 相机移动/传送等特性(确保摇杆只用于移动皮卡丘)
+        // 关闭会抢右摇杆的功能:只让我们移动皮卡丘
         var fm = xr.baseExperience.featuresManager;
-        try { fm.disableFeature(BABYLON.WebXRFeatureName.MOVEMENT); }     catch(e){}
-        try { fm.disableFeature(BABYLON.WebXRFeatureName.TELEPORTATION);} catch(e){}
-        // POINTER_SELECTION 在本场景里也不用
-        try { fm.disableFeature(BABYLON.WebXRFeatureName.POINTER_SELECTION);} catch(e){}
+        try { fm.disableFeature(BABYLON.WebXRFeatureName.MOVEMENT); } catch(e){}
+        try { fm.disableFeature(BABYLON.WebXRFeatureName.TELEPORTATION); } catch(e){}
+        try { fm.disableFeature(BABYLON.WebXRFeatureName.POINTER_SELECTION); } catch(e){}
 
-        // Enable WebXR Hit Test
-        var hitTest = fm.enableFeature(
-            BABYLON.WebXRFeatureName.HIT_TEST,
-            "latest",
-            { entityTypes: ["plane", "point"] }
-        );
+        // Hit Test
+        var hitTest = fm.enableFeature(BABYLON.WebXRFeatureName.HIT_TEST, "latest",
+            { entityTypes: ["plane", "point"] });
 
-        // AR reticle (torus). It appears when AR hit test succeeds.
+        // Reticle
         var reticle = BABYLON.MeshBuilder.CreateTorus("reticle_ar",
             { diameter: 0.15, thickness: 0.003, tessellation: 32 }, scene);
         reticle.rotationQuaternion = new BABYLON.Quaternion();
         reticle.isVisible = false;
-        reticle.isPickable = false; // do not interfere with picking
+        reticle.isPickable = false;
         var retMat = new BABYLON.StandardMaterial("retMat_ar", scene);
         retMat.emissiveColor = new BABYLON.Color3(0.1, 0.9, 0.2);
-        retMat.disableLighting = true; // clearly green regardless of lights
+        retMat.disableLighting = true;
         reticle.material = retMat;
 
         hitTest.onHitTestResultObservable.add(function (results) {
@@ -157,7 +170,7 @@ var createScene = function () {
             if (xrInput.inputSource.handedness !== "right") return;
 
             xrInput.onMotionControllerInitObservable.add(function (mc) {
-                // Trigger => place a NEW instance at reticle pose
+                // Trigger => place new Pikachu
                 var trigger = mc.getComponent("xr-standard-trigger");
                 if (trigger) {
                     trigger.onButtonStateChangedObservable.add(function () {
@@ -165,34 +178,34 @@ var createScene = function () {
                         if (!reticle.isVisible) return;
                         if (!modelProto) return;
 
-                        var inst = modelProto.clone("placed_ar_" + Date.now());
-                        inst.getChildMeshes().forEach(function (m) { m.isVisible = true; });
-                        inst.setEnabled(true);
+                        // 实例化(保证层级完整)
+                        var inst = createInstanceFromPrototype(modelProto, "placed_ar_" + Date.now(), scene);
 
+                        // 放到命中位姿,并让它朝向你
                         inst.position.copyFrom(reticle.position);
-                        inst.rotationQuaternion = reticle.rotationQuaternion.clone();
-                        // face the user
+                        if (!inst.rotationQuaternion)
+                            inst.rotationQuaternion = reticle.rotationQuaternion.clone();
+                        else
+                            inst.rotationQuaternion.copyFrom(reticle.rotationQuaternion);
+
                         inst.addRotation(0, FACE_YAW, 0);
 
-                        // mark (no desktop drag now)
-                        attachHorizontalDrag(inst, scene);
-
+                        // 记录/选中
                         placedList.push(inst);
-                        selectedInst = inst; // newest becomes selected
+                        selectedInst = inst;
                     });
                 }
 
-                // Thumbstick => move the selected model on XZ plane (ONLY this; camera move disabled above)
+                // Thumbstick => move selected on XZ plane
                 var stick = mc.getComponent("xr-standard-thumbstick");
                 if (stick) {
                     var lastTS = performance.now();
                     stick.onAxisValueChangedObservable.add(function (axes) {
                         if (!selectedInst) return;
                         var now = performance.now();
-                        var dt = Math.min((now - lastTS) / 1000, 0.05); // seconds, clamp max step
+                        var dt = Math.min((now - lastTS) / 1000, 0.05);
                         lastTS = now;
 
-                        // axes.x: right positive; axes.y: up is negative forward => z negative
                         selectedInst.position.x += axes.x * MOVE_SPEED * dt;
                         selectedInst.position.z += -axes.y * MOVE_SPEED * dt;
                     });
@@ -202,7 +215,6 @@ var createScene = function () {
     }).catch(function (e) {
         console.warn("WebXR not available or failed to init:", e);
     });
-
 
     return scene;
 };
