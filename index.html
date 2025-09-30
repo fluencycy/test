@@ -1,0 +1,349 @@
+<!doctype html>
+<html>
+    <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+
+        <title>Babylon.js sample code</title>
+
+        <!-- Babylon.js -->
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.6.2/dat.gui.min.js"></script>
+        <script src="https://assets.babylonjs.com/generated/Assets.js"></script>
+        <script src="https://cdn.babylonjs.com/recast.js"></script>
+        <script src="https://cdn.babylonjs.com/ammo.js"></script>
+        <script src="https://cdn.babylonjs.com/havok/HavokPhysics_umd.js"></script>
+        <script src="https://cdn.babylonjs.com/cannon.js"></script>
+        <script src="https://cdn.babylonjs.com/Oimo.js"></script>
+        <script src="https://cdn.babylonjs.com/earcut.min.js"></script>
+        <script src="https://cdn.babylonjs.com/babylon.js"></script>
+        <script src="https://cdn.babylonjs.com/materialsLibrary/babylonjs.materials.min.js"></script>
+        <script src="https://cdn.babylonjs.com/proceduralTexturesLibrary/babylonjs.proceduralTextures.min.js"></script>
+        <script src="https://cdn.babylonjs.com/postProcessesLibrary/babylonjs.postProcess.min.js"></script>
+        <script src="https://cdn.babylonjs.com/loaders/babylonjs.loaders.js"></script>
+        <script src="https://cdn.babylonjs.com/serializers/babylonjs.serializers.min.js"></script>
+        <script src="https://cdn.babylonjs.com/gui/babylon.gui.min.js"></script>
+        <script src="https://cdn.babylonjs.com/addons/babylonjs.addons.min.js"></script>
+        <script src="https://cdn.babylonjs.com/inspector/babylon.inspector.bundle.js"></script>
+
+        <style>
+            html,
+            body {
+                overflow: hidden;
+                width: 100%;
+                height: 100%;
+                margin: 0;
+                padding: 0;
+            }
+
+            #renderCanvas {
+                width: 100%;
+                height: 100%;
+                touch-action: none;
+            }
+
+            #canvasZone {
+                width: 100%;
+                height: 100%;
+            }
+        </style>
+    </head>
+    <body>
+        <div id="canvasZone"><canvas id="renderCanvas"></canvas></div>
+        <script>
+                    var canvas = document.getElementById("renderCanvas");
+
+                    var startRenderLoop = function (engine, canvas) {
+                        engine.runRenderLoop(function () {
+                            if (sceneToRender && sceneToRender.activeCamera) {
+                                sceneToRender.render();
+                            }
+                        });
+                    }
+
+                    var engine = null;
+        var scene = null;
+        var sceneToRender = null;
+        var createDefaultEngine = function() { return new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true,  disableWebGL2Support: false}); };
+        // Full drop-in code for Babylon.js:
+// - AR mode: WebXR + Hit Test + right trigger to place MANY models
+// - AR mode: Right thumbstick moves the currently selected model on the horizontal plane
+// - Desktop fallback: Mouse to PLACE on ground, CLICK to SELECT a model, and MOUSE-DRAG to MOVE it on the horizontal plane
+// - Fix: reticle clearly visible (green, lighting-independent), and not pickable
+// - New: every placed model gets a PointerDragBehavior (horizontal-plane constrained) that works on desktop
+
+var placedList = [];                 // store all placed instances
+var selectedInst = null;             // the instance to move
+var FACE_YAW = Math.PI;              // rotate 180° so the model faces you (tweak if needed)
+var MOVE_SPEED = 0.6;                // m/s for AR thumbstick
+var KEY_SPEED  = 1.2;                // m/s for desktop keyboard (kept for convenience; drag is primary now)
+
+// helper: attach horizontal-plane drag to an instance (desktop)
+function attachHorizontalDrag(inst, scene) {
+    var drag = new BABYLON.PointerDragBehavior({ dragPlaneNormal: new BABYLON.Vector3(0, 1, 0) });
+    drag.useObjectOrientationForDragging = false;
+    drag.updateDragPlane = false; // fixed horizontal plane
+    inst.addBehavior(drag);
+    // optional: snap movement callbacks
+    drag.onDragStartObservable.add(() => { selectedInst = inst; });
+    // tag for picking logic
+    if (!inst.metadata) inst.metadata = {};
+    inst.metadata.placed = true;
+}
+
+var createScene = function () {
+    // ---------- Your original setup ----------
+    var scene = new BABYLON.Scene(engine);
+
+    var camera = new BABYLON.FreeCamera("camera1", new BABYLON.Vector3(0, 5, -10), scene);
+    camera.setTarget(BABYLON.Vector3.Zero());
+    camera.attachControl(canvas, true);
+    if (camera.inputs) {
+    camera.inputs.removeByType("FreeCameraGamepadInput");
+    }
+    var light = new BABYLON.HemisphericLight("light", new BABYLON.Vector3(0, 1, 0), scene);
+    light.intensity = 0.7;
+
+    var GLB_URL = "./pikachu.glb";
+    var modelProto = null; // prototype holder to clone for placement
+
+    BABYLON.SceneLoader.Append("", GLB_URL, scene, function () {
+        // Group everything (except ground) under a hidden root as prototype
+        var all = scene.meshes.filter(function (m) { return m.name !== "ground"; });
+        var root = new BABYLON.TransformNode("root", scene);
+        all.forEach(function (m) { m.setParent(root); });
+
+        root.scaling.setAll(0.05);
+        root.setEnabled(false);        // keep as prototype (hidden)
+        modelProto = root;
+    });
+
+    var ground = BABYLON.MeshBuilder.CreateGround("ground", { width: 6, height: 6 }, scene);
+
+    // ---------- Q3(b): WebXR AR + Hit Test + right trigger to place ----------
+    scene.createDefaultXRExperienceAsync({
+        uiOptions: { sessionMode: "immersive-ar", referenceSpaceType: "local-floor" },
+        optionalFeatures: true
+    }).then(function (xr) {
+        // Enable WebXR Hit Test
+        var fm = xr.baseExperience.featuresManager;
+        try { fm.disableFeature(BABYLON.WebXRFeatureName.MOVEMENT); } catch(e){}
+        try { fm.disableFeature(BABYLON.WebXRFeatureName.TELEPORTATION); } catch(e){}
+        var hitTest = xr.baseExperience.featuresManager.enableFeature(
+            BABYLON.WebXRFeatureName.HIT_TEST,
+            "latest",
+            { entityTypes: ["plane", "point"] }
+        );
+        xr.baseExperience.onStateChangedObservable.add(function (state) {
+        if (state === BABYLON.WebXRState.IN_XR) {
+            ground.setEnabled(false);   // 或 ground.isVisible = false;
+        } else {
+            ground.setEnabled(true);    // 或 ground.isVisible = true;
+        }
+        });
+        // AR reticle (torus). It appears when AR hit test succeeds.
+        var reticle = BABYLON.MeshBuilder.CreateTorus("reticle_ar",
+            { diameter: 0.15, thickness: 0.003, tessellation: 32 }, scene);
+        reticle.rotationQuaternion = new BABYLON.Quaternion();
+        reticle.isVisible = false;
+        reticle.isPickable = false; // do not interfere with picking
+        var retMat = new BABYLON.StandardMaterial("retMat_ar", scene);
+        retMat.emissiveColor = new BABYLON.Color3(0.1, 0.9, 0.2);
+        retMat.disableLighting = true; // make it clearly green regardless of lights
+        reticle.material = retMat;
+
+        hitTest.onHitTestResultObservable.add(function (results) {
+            if (results && results.length > 0) {
+                var hit = results[0];
+                hit.transformationMatrix.decompose(reticle.scaling, reticle.rotationQuaternion, reticle.position);
+                reticle.isVisible = true;
+            } else {
+                reticle.isVisible = false;
+            }
+        });
+
+        // Right controller: trigger to place; thumbstick to move selected model
+        xr.input.onControllerAddedObservable.add(function (xrInput) {
+            if (xrInput.inputSource.handedness !== "right") return;
+
+            xrInput.onMotionControllerInitObservable.add(function (mc) {
+                // Trigger => place a NEW instance at reticle pose
+                var trigger = mc.getComponent("xr-standard-trigger");
+                if (trigger) {
+                    trigger.onButtonStateChangedObservable.add(function () {
+                        if (!trigger.pressed) return;
+                        if (!reticle.isVisible) return;
+                        if (!modelProto) return;
+
+                        var inst = modelProto.clone("placed_ar_" + Date.now());
+                        inst.getChildMeshes().forEach(function (m) { m.isVisible = true; });
+                        inst.setEnabled(true);
+
+                        inst.position.copyFrom(reticle.position);
+                        inst.rotationQuaternion = reticle.rotationQuaternion.clone();
+                        // face the user
+                        inst.addRotation(0, FACE_YAW, 0);
+
+                        // attach desktop drag behavior too (harmless in XR)
+                        attachHorizontalDrag(inst, scene);
+
+                        placedList.push(inst);
+                        selectedInst = inst; // newest becomes selected
+                    });
+                }
+
+                // Thumbstick => move the selected model on XZ plane
+                var stick = mc.getComponent("xr-standard-thumbstick");
+                if (stick) {
+                    var lastTS = performance.now();
+                    stick.onAxisValueChangedObservable.add(function (axes) {
+                        if (!selectedInst) return;
+                        var now = performance.now();
+                        var dt = Math.min((now - lastTS) / 1000, 0.05); // seconds, clamp max step
+                        lastTS = now;
+
+                        // axes.x: right positive; axes.y: up is negative forward => z negative
+                        selectedInst.position.x += axes.x * MOVE_SPEED * dt;
+                        selectedInst.position.z += -axes.y * MOVE_SPEED * dt;
+                    });
+                }
+            });
+        });
+    }).catch(function (e) {
+        console.warn("WebXR not available or failed to init:", e);
+    });
+
+    // ---------- Desktop fallback (no AR device): mouse place + click select + drag move ----------
+    (function setupDesktopFallback() {
+        var xr = navigator.xr;
+        var support = xr && xr.isSessionSupported ? xr.isSessionSupported("immersive-ar") : Promise.resolve(false);
+
+        Promise.resolve(support).then(function (ok) {
+            if (ok) return; // AR supported => skip fallback
+
+            // Fallback reticle (same look as AR one)
+            var reticle = BABYLON.MeshBuilder.CreateTorus("reticle_fallback",
+                { diameter: 0.15, thickness: 0.003, tessellation: 32 }, scene);
+            reticle.rotationQuaternion = new BABYLON.Quaternion();
+            reticle.isVisible = false;
+            reticle.isPickable = false;
+            var retMat = new BABYLON.StandardMaterial("retMat_fallback", scene);
+            retMat.emissiveColor = new BABYLON.Color3(0.1, 0.9, 0.2);
+            retMat.disableLighting = true;
+            reticle.material = retMat;
+
+            // Update reticle with mouse (ray-pick the ground)
+            scene.onPointerMove = function () {
+                var pickInfo = scene.pick(scene.pointerX, scene.pointerY, function (m) { return m && m.name === "ground"; });
+                if (pickInfo && pickInfo.hit) {
+                    reticle.position.copyFrom(pickInfo.pickedPoint);
+                    reticle.rotationQuaternion.copyFrom(BABYLON.Quaternion.Identity()); // align to horizontal plane
+                    reticle.isVisible = true;
+                } else {
+                    reticle.isVisible = false;
+                }
+            };
+
+            // Click to place OR select:
+            // - If clicking on a placed model -> select it (drag will auto-start because of behavior)
+            // - Else if clicking ground at a visible reticle -> place a new one
+            scene.onPointerDown = function (evt, pick) {
+                // First check if clicking an existing instance
+                var pickInfo = scene.pick(scene.pointerX, scene.pointerY, function (m) {
+                    return m && m.metadata && m.metadata.placed === true;
+                });
+                if (pickInfo && pickInfo.hit && pickInfo.pickedMesh) {
+                    // Select the clicked instance
+                    var root = pickInfo.pickedMesh;
+                    // If user clicked a child mesh, climb to its root (our inst is a TransformNode)
+                    while (root && root.parent && root.parent.metadata && root.parent.metadata.placed) root = root.parent;
+                    selectedInst = root.metadata && root.metadata.placed ? root : selectedInst;
+                    return; // do not place a new one
+                }
+
+                // Otherwise, place a new instance at reticle
+                if (evt.button !== 0) return;     // left button only
+                if (!reticle.isVisible) return;
+                if (!modelProto) return;          // model not loaded yet
+
+                var inst = modelProto.clone("placed_fallback_" + Date.now());
+                inst.getChildMeshes().forEach(function (m) { m.isVisible = true; });
+                inst.setEnabled(true);
+
+                inst.position.copyFrom(reticle.position);
+                inst.rotationQuaternion = BABYLON.Quaternion.Identity();
+                // face the user
+                inst.addRotation(0, FACE_YAW, 0);
+
+                // mark & attach drag behavior
+                if (!inst.metadata) inst.metadata = {};
+                inst.metadata.placed = true;
+                attachHorizontalDrag(inst, scene);
+
+                placedList.push(inst);
+                selectedInst = inst; // newest becomes selected for movement
+            };
+
+            // Optional: keyboard move still supported
+            var keyState = { w:false, a:false, s:false, d:false, ArrowUp:false, ArrowDown:false, ArrowLeft:false, ArrowRight:false };
+            window.addEventListener("keydown", function (e) { if (e.key in keyState) keyState[e.key] = true; });
+            window.addEventListener("keyup",   function (e) { if (e.key in keyState) keyState[e.key] = false; });
+
+            var lastFrame = performance.now();
+            scene.onBeforeRenderObservable.add(function () {
+                if (!selectedInst) { lastFrame = performance.now(); return; }
+                var now = performance.now();
+                var dt = Math.min((now - lastFrame) / 1000, 0.05); // seconds
+                lastFrame = now;
+
+                var vx = 0, vz = 0;
+                if (keyState.a || keyState.ArrowLeft)  vx -= 1;
+                if (keyState.d || keyState.ArrowRight) vx += 1;
+                if (keyState.w || keyState.ArrowUp)    vz -= 1; // forward = -z
+                if (keyState.s || keyState.ArrowDown)  vz += 1;
+
+                if (vx !== 0 || vz !== 0) {
+                    var len = Math.hypot(vx, vz);
+                    vx /= len; vz /= len;
+                    selectedInst.position.x += vx * KEY_SPEED * dt;
+                    selectedInst.position.z += vz * KEY_SPEED * dt;
+                }
+            });
+
+            console.log("[XR] immersive-ar not supported; desktop fallback enabled (mouse place, click to select, drag to move).");
+        });
+    })();
+
+    return scene;
+};
+
+                window.initFunction = async function() {
+                    
+                    
+                    
+                    var asyncEngineCreation = async function() {
+                        try {
+                        return createDefaultEngine();
+                        } catch(e) {
+                        console.log("the available createEngine function failed. Creating the default engine instead");
+                        return createDefaultEngine();
+                        }
+                    }
+
+                    window.engine = await asyncEngineCreation();
+                    
+                    const engineOptions = window.engine.getCreationOptions?.();
+                    if (!engineOptions || engineOptions.audioEngine !== false) {
+                        
+                    }
+        if (!engine) throw 'engine should not be null.';
+        startRenderLoop(engine, canvas);
+        window.scene = createScene();};
+        initFunction().then(() => {sceneToRender = scene
+                    });
+
+                    // Resize
+                    window.addEventListener("resize", function () {
+                        engine.resize();
+                    });
+        </script>
+    </body>
+</html>
